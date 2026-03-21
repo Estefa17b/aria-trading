@@ -5,8 +5,41 @@ import {
 } from "recharts";
 
 // ─── API KEYS — pon tus keys aquí o en .env ───────────────────────────────────
-const ANTHROPIC_KEY = process.env.REACT_APP_ANTHROPIC_KEY || "";
-const FINNHUB_KEY   = process.env.REACT_APP_FINNHUB_KEY   || "";
+const ANTHROPIC_KEY  = process.env.REACT_APP_ANTHROPIC_KEY  || "";
+const FINNHUB_KEY    = process.env.REACT_APP_FINNHUB_KEY    || "";
+const SUPABASE_URL   = process.env.REACT_APP_SUPABASE_URL   || "https://hjmldvsxtzchmjtywiax.supabase.co";
+const SUPABASE_KEY   = process.env.REACT_APP_SUPABASE_KEY   || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhqbWxkdnN4dHpjaG1qdHl3aWF4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDY2NjUsImV4cCI6MjA4OTYyMjY2NX0.rw7qRMIAZ4u6KZM8a75wHt441rFgtTMRNKIE-XArexY";
+
+// ─── Supabase helpers ─────────────────────────────────────────────────────────
+const sbFetch = (path, opts={}) => fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+  ...opts,
+  headers: {
+    "apikey": SUPABASE_KEY,
+    "Authorization": `Bearer ${SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+    ...(opts.headers||{}),
+  },
+});
+
+async function sbInsert(table, data) {
+  try {
+    await sbFetch(table, { method:"POST", body: JSON.stringify(data) });
+  } catch(e) { console.warn("Supabase insert error:", e); }
+}
+
+async function sbSelect(table, params="") {
+  try {
+    const r = await sbFetch(`${table}?${params}`);
+    return await r.json();
+  } catch { return []; }
+}
+
+async function sbUpdate(table, id, data) {
+  try {
+    await sbFetch(`${table}?id=eq.${id}`, { method:"PATCH", body: JSON.stringify(data) });
+  } catch(e) { console.warn("Supabase update error:", e); }
+}
 
 // ─── Assets ───────────────────────────────────────────────────────────────────
 const ASSET_GROUPS = {
@@ -214,6 +247,14 @@ export default function App() {
   const [countdown, setCd]          = useState(3600);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [noKeys, setNoKeys]         = useState(false);
+  const [dbHistory, setDbHistory]   = useState([]);
+  const [dbLoading, setDbLoading]   = useState(false);
+  const [outcomeMap, setOutcomeMap] = useState({});
+  const [chatOpen, setChatOpen]     = useState(false);
+  const [chatMsgs, setChatMsgs]     = useState([{role:"aria", text:"¡Hola! Soy ARIA, tu agente de trading IA. Puedes preguntarme sobre cualquier activo, comentarme el resultado de operaciones anteriores, o pedirme análisis específicos. ¿En qué puedo ayudarte?"}]);
+  const [chatInput, setChatInput]   = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatEndRef = useRef(null);
 
   const wsRef  = useRef(null);
   const cdRef  = useRef(null);
@@ -457,10 +498,129 @@ Responde ÚNICAMENTE con JSON válido sin backticks:
       setSignal(entry);
       setLeverage(parsed.leverage);
       setHistory(prev => [...prev.slice(-19), entry]);
+      saveSignalToDB(entry, fmt(price, dp));
     } catch(e) {
       setSignal({error:true, errorMsg: e.message?.includes("401") ? "invalid-key" : "general"});
     }
     setAnalyzing(false);
+  };
+
+  // ── Database ────────────────────────────────────────────────────────────────
+  const loadDbHistory = async () => {
+    setDbLoading(true);
+    const rows = await sbSelect("signals", "order=created_at.desc&limit=50");
+    if (Array.isArray(rows)) setDbHistory(rows);
+    setDbLoading(false);
+  };
+
+  useEffect(() => { loadDbHistory(); }, []);
+
+  const saveSignalToDB = async (sig, price) => {
+    await sbInsert("signals", {
+      asset:           sig.asset,
+      signal:          sig.signal,
+      confidence:      sig.confidence,
+      leverage:        sig.leverage,
+      entry:           sig.entry,
+      stop_loss:       sig.stopLoss,
+      take_profit:     sig.takeProfit,
+      risk_reward:     sig.riskRewardRatio,
+      price_at_signal: price,
+      market_structure:sig.marketStructure,
+      summary:         sig.summary,
+      news_impact:     sig.newsImpact || null,
+      outcome:         "pending",
+    });
+    loadDbHistory();
+  };
+
+  const updateOutcome = async (id, outcome, pnl) => {
+    await sbUpdate("signals", id, { outcome, pnl: pnl || null });
+    setOutcomeMap(prev => ({...prev, [id]: outcome}));
+    loadDbHistory();
+  };
+
+  const saveChatToDB = async (role, content, asset) => {
+    await sbInsert("chat_messages", { role, content, asset });
+  };
+
+  const saveNewsToDB = async (newsArr, asset) => {
+    for (const n of newsArr.slice(0,5)) {
+      await sbInsert("news_log", { headline: n.headline, source: n.source, asset });
+    }
+  };
+
+  // ── Chat with ARIA ──────────────────────────────────────────────────────────
+  const sendChat = async () => {
+    if (!chatInput.trim() || chatLoading) return;
+    if (!ANTHROPIC_KEY) {
+      setChatMsgs(prev => [...prev, {role:"user",text:chatInput}, {role:"aria",text:"⚠ Necesitas configurar tu API key de Anthropic para chatear conmigo."}]);
+      setChatInput("");
+      return;
+    }
+    const userMsg = chatInput.trim();
+    setChatMsgs(prev => [...prev, {role:"user", text:userMsg}]);
+    setChatInput("");
+    setChatLoading(true);
+    saveChatToDB("user", userMsg, asset.label);
+
+    const ctx = {
+      asset: asset.label,
+      price: ticker ? `$${fmt(ticker.price, ticker.price>100?2:4)}` : "N/D",
+      change24h: ticker ? `${ticker.ch24>=0?"+":""}${ticker.ch24.toFixed(2)}%` : "N/D",
+      rsi: rsi ? rsi.toFixed(1) : "N/D",
+      macd: macd.macd ?? "N/D",
+      lastSignal: history.length ? `${history.at(-1).signal} @ $${history.at(-1).priceAtSignal} (confianza: ${history.at(-1).confidence}%)` : "Sin señales previas",
+      totalSignals: history.length,
+      news: news.slice(0,3).map(n=>n.headline).join(" | ") || "Sin noticias",
+    };
+
+    const systemPrompt = `Eres ARIA, una agente experta en trading cuantitativo con IA avanzada. Tienes acceso al contexto completo del mercado en tiempo real.
+
+CONTEXTO ACTUAL:
+- Activo seleccionado: ${ctx.asset}
+- Precio actual: ${ctx.price}
+- Cambio 24h: ${ctx.change24h}
+- RSI(14): ${ctx.rsi}
+- MACD: ${ctx.macd}
+- Última señal generada: ${ctx.lastSignal}
+- Total señales esta sesión: ${ctx.totalSignals}
+- Noticias recientes: ${ctx.news}
+
+Responde de forma concisa y profesional. Si te comentan resultados de operaciones, aprende de ellos y ajusta tu perspectiva. Si te piden análisis, usa los datos del contexto. Usa emojis ocasionalmente para hacer las respuestas más claras. Máximo 4 oraciones por respuesta salvo que se pida más detalle.`;
+
+    // Build conversation history for context
+    const msgs = chatMsgs.slice(-8).map(m => ({
+      role: m.role === "aria" ? "assistant" : "user",
+      content: m.text
+    }));
+    msgs.push({role:"user", content:userMsg});
+
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "x-api-key": ANTHROPIC_KEY,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 400,
+          system: systemPrompt,
+          messages: msgs,
+        }),
+      });
+      const data = await res.json();
+      const reply = data.content?.map(b=>b.text||"conduct").join("") || "Lo siento, no pude procesar tu mensaje.";
+      setChatMsgs(prev => [...prev, {role:"aria", text:reply}]);
+      saveChatToDB("aria", reply, asset.label);
+    } catch {
+      setChatMsgs(prev => [...prev, {role:"aria", text:"⚠ Error de conexión. Verifica tu API key."}]);
+    }
+    setChatLoading(false);
+    setTimeout(() => chatEndRef.current?.scrollIntoView({behavior:"smooth"}), 100);
   };
 
   const sigColor = s => {
@@ -567,6 +727,9 @@ Responde ÚNICAMENTE con JSON válido sin backticks:
         .news-card:hover{background:${C.accentBg}!important;cursor:pointer;}
         @media(max-width:820px){
           .dsidebar{display:none!important;}.mobham{display:flex!important;}
+          .desknav{display:none!important;}
+          .livestatus{display:none!important;}
+          .darkbtn{padding:3px 6px!important;font-size:14px!important;}
           .kpigrid{grid-template-columns:1fr 1fr!important;}
           .chartgrid{grid-template-columns:1fr!important;}
           .siggrid{grid-template-columns:1fr 1fr!important;}
@@ -589,6 +752,22 @@ Responde ÚNICAMENTE con JSON válido sin backticks:
       )}
 
       {/* Mobile overlay */}
+      {/* Mobile bottom nav */}
+      <nav style={{display:"none"}} className="mobnav">
+        <style>{`.mobnav{display:none!important;} @media(max-width:820px){.mobnav{display:flex!important;position:fixed;bottom:0;left:0;right:0;background:${C.surface};borderTop:1px solid ${C.border};zIndex:99;padding:8px 0 12px;}}`}</style>
+        {[
+          ["dashboard", lang==="es"?"Panel":"Dashboard", "📊"],
+          ["news",      lang==="es"?"Noticias":"News",    "📰"],
+          ["portfolio", lang==="es"?"Portafolio":"Portfolio","💼"],
+        ].map(([key,label,icon]) => (
+          <button key={key} onClick={()=>{setTab(key);setMobileOpen(false);}}
+            style={{flex:1,background:"none",border:"none",cursor:"pointer",padding:"4px 0",display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+            <span style={{fontSize:18}}>{icon}</span>
+            <span style={{fontSize:10,fontWeight:tab===key?700:400,color:tab===key?C.accent:C.subtle}}>{label}</span>
+          </button>
+        ))}
+      </nav>
+
       {mobileOpen && (
         <div className="moverlay" style={{background:C.surface}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 16px",borderBottom:`1px solid ${C.border}`}}>
@@ -600,35 +779,45 @@ Responde ÚNICAMENTE con JSON válido sin backticks:
       )}
 
       {/* Header */}
-      <header style={{background:C.surface,borderBottom:`1px solid ${C.border}`,height:56,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 20px",position:"sticky",top:0,zIndex:100,boxShadow:C.card2}}>
-        <Logo C={C}/>
-        <nav style={{display:"flex",gap:2}}>
-          {[
-            ["dashboard", lang==="es"?"Panel":"Dashboard"],
-            ["news",      lang==="es"?"Noticias":"News"],
-            ["portfolio", lang==="es"?"Portafolio":"Portfolio"],
-          ].map(([key,label]) => (
-            <button key={key} className="ntab" onClick={()=>setTab(key)}
-              style={{padding:"5px 14px",fontSize:12.5,fontWeight:tab===key?600:400,color:tab===key?C.accent:C.subtle,background:tab===key?C.accentBg:"transparent",borderRadius:6}}>
-              {label}
+      <header style={{background:C.surface,borderBottom:`1px solid ${C.border}`,position:"sticky",top:0,zIndex:100,boxShadow:C.card2}}>
+        {/* Main header row */}
+        <div style={{height:56,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 14px",gap:8}}>
+          <Logo C={C}/>
+          {/* Scrollable controls row */}
+          <div style={{display:"flex",alignItems:"center",gap:6,overflowX:"auto",WebkitOverflowScrolling:"touch",scrollbarWidth:"none",msOverflowStyle:"none",flex:1,justifyContent:"flex-end",minWidth:0}}>
+            <style>{`div::-webkit-scrollbar{display:none}`}</style>
+            {/* Nav tabs */}
+            {[
+              ["dashboard", lang==="es"?"Panel":"Dashboard"],
+              ["news",      lang==="es"?"Noticias":"News"],
+              ["portfolio", lang==="es"?"Portafolio":"Portfolio"],
+            ].map(([key,label]) => (
+              <button key={key} className="ntab" onClick={()=>setTab(key)}
+                style={{padding:"5px 10px",fontSize:12,fontWeight:tab===key?600:400,color:tab===key?C.accent:C.subtle,background:tab===key?C.accentBg:"transparent",borderRadius:6,whiteSpace:"nowrap",flexShrink:0}}>
+                {label}
+              </button>
+            ))}
+            {/* Divider */}
+            <div style={{width:1,height:18,background:C.border,flexShrink:0}}/>
+            {/* Live status */}
+            <div style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+              <div style={{width:5,height:5,borderRadius:"50%",background:statusColor}} className={dataStatus==="live"?"pulse":""}/>
+              <span style={{fontSize:9,color:statusColor,fontFamily:"'DM Mono'",letterSpacing:0.8,whiteSpace:"nowrap"}}>{statusLabel}</span>
+            </div>
+            {/* Lang toggle */}
+            <button className="hbtn" onClick={()=>setLang(l=>l==="es"?"en":"es")}
+              style={{padding:"3px 8px",fontSize:11,fontWeight:600,color:C.accent,border:`1px solid ${C.border}`,borderRadius:6,flexShrink:0}}>
+              {lang==="es"?"EN":"ES"}
             </button>
-          ))}
-        </nav>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <div style={{display:"flex",alignItems:"center",gap:5}}>
-            <div style={{width:5,height:5,borderRadius:"50%",background:statusColor}} className={dataStatus==="live"?"pulse":""}/>
-            <span style={{fontSize:9,color:statusColor,fontFamily:"'DM Mono'",letterSpacing:0.8,whiteSpace:"nowrap"}}>{statusLabel}</span>
+            {/* Dark toggle */}
+            <button className="hbtn" onClick={()=>setDark(d=>!d)}
+              style={{padding:"3px 8px",fontSize:11,color:C.text,border:`1px solid ${C.border}`,borderRadius:6,flexShrink:0,whiteSpace:"nowrap"}}>
+              {dark?"☀":"◑"}
+            </button>
           </div>
-          <button className="hbtn" onClick={()=>setLang(l=>l==="es"?"en":"es")}
-            style={{padding:"3px 10px",fontSize:11,fontWeight:600,color:C.accent,border:`1px solid ${C.border}`,borderRadius:6}}>
-            {lang==="es"?"EN":"ES"}
-          </button>
-          <button className="hbtn" onClick={()=>setDark(d=>!d)}
-            style={{padding:"3px 10px",fontSize:11,color:C.text,border:`1px solid ${C.border}`,borderRadius:6}}>
-            {dark?"☀ Claro":"◑ Oscuro"}
-          </button>
+          {/* Hamburger - always visible on mobile, fixed right */}
           <button className="hbtn mobham" onClick={()=>setMobileOpen(true)}
-            style={{fontSize:18,color:C.text,display:"none",alignItems:"center"}}>☰</button>
+            style={{fontSize:20,color:C.text,display:"none",alignItems:"center",padding:"0 2px",flexShrink:0}}>☰</button>
         </div>
       </header>
 
@@ -1023,6 +1212,89 @@ REACT_APP_FINNHUB_KEY=tu_key_de_finnhub`}
           )}
 
           {/* ── PORTFOLIO TAB ── */}
+          {tab==="history" && (
+            <div className="fade">
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
+                <div>
+                  <h2 style={{fontFamily:"'Libre Baskerville'",fontSize:20,fontWeight:700,color:C.heading,marginBottom:4}}>
+                    {lang==="es"?"Historial Global de Señales":"Global Signal History"}
+                  </h2>
+                  <p style={{fontSize:12,color:C.subtle}}>{lang==="es"?"Todas las señales guardadas en la base de datos":"All signals saved in database"}</p>
+                </div>
+                <button className="hbtn" onClick={loadDbHistory}
+                  style={{padding:"7px 14px",fontSize:12,color:C.text,border:`1px solid ${C.border}`,borderRadius:8,background:C.card}}>
+                  ⟳ {lang==="es"?"Actualizar":"Refresh"}
+                </button>
+              </div>
+              {dbLoading ? (
+                <div style={{display:"flex",alignItems:"center",gap:12,color:C.subtle,padding:"24px 0"}}>
+                  <div className="spin" style={{width:16,height:16,border:`2px solid ${C.border}`,borderTopColor:C.accent,borderRadius:"50%"}}/>
+                  {lang==="es"?"Cargando…":"Loading…"}
+                </div>
+              ) : dbHistory.length===0 ? (
+                <div style={{textAlign:"center",padding:"48px 24px"}}>
+                  <div style={{fontSize:32,marginBottom:12}}>🗄️</div>
+                  <div style={{fontFamily:"'Libre Baskerville'",fontSize:17,color:C.heading,marginBottom:8}}>
+                    {lang==="es"?"Sin señales aún":"No signals yet"}
+                  </div>
+                  <p style={{fontSize:12.5,color:C.subtle}}>{lang==="es"?"Genera señales con ARIA para verlas aquí":"Generate ARIA signals to see them here"}</p>
+                </div>
+              ) : dbHistory.map((s,i) => {
+                const sc = s.signal==="LONG"?C.long:s.signal==="SHORT"?C.short:C.wait;
+                return (
+                  <div key={i} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 20px",boxShadow:C.card2,marginBottom:12}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                      <div>
+                        <div style={{fontSize:9,color:C.subtle,letterSpacing:1,textTransform:"uppercase",marginBottom:4}}>
+                          {s.asset} · {new Date(s.created_at).toLocaleString("es",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontFamily:"'Libre Baskerville'",fontSize:18,fontWeight:700,color:sc}}>{s.signal}</span>
+                          <span style={{fontFamily:"'DM Mono'",fontSize:11,color:C.subtle}}>{s.leverage}x · {s.confidence}%</span>
+                        </div>
+                      </div>
+                      <div style={{textAlign:"right"}}>
+                        <div style={{fontSize:9,color:C.subtle,marginBottom:2}}>{lang==="es"?"Precio":"Price"}</div>
+                        <div style={{fontFamily:"'DM Mono'",fontSize:14,fontWeight:700,color:C.heading}}>${s.price_at_signal}</div>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:14,flexWrap:"wrap",marginBottom:10}}>
+                      {[
+                        {label:"Entry",value:`$${s.entry}`,color:C.accent},
+                        {label:"SL",value:`$${s.stop_loss}`,color:C.short},
+                        {label:"TP",value:`$${s.take_profit}`,color:C.long},
+                        {label:"R/R",value:`1:${Number(s.risk_reward||0).toFixed(1)}`,color:C.text},
+                      ].map((k,j)=>(
+                        <span key={j} style={{fontSize:11,color:C.subtle}}>
+                          <span style={{fontWeight:600}}>{k.label}: </span>
+                          <span style={{fontFamily:"'DM Mono'",color:k.color,fontWeight:600}}>{k.value}</span>
+                        </span>
+                      ))}
+                    </div>
+                    {s.summary && <p style={{fontSize:12,color:C.subtle,lineHeight:1.5,fontStyle:"italic",marginBottom:12}}>{s.summary.slice(0,160)}…</p>}
+                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                      <span style={{fontSize:10,color:C.subtle,fontWeight:600}}>{lang==="es"?"Resultado:":"Outcome:"}</span>
+                      {[
+                        {key:"pending",  label:lang==="es"?"Pendiente":"Pending",   color:C.subtle},
+                        {key:"win",      label:lang==="es"?"✓ Ganó":"✓ Win",        color:C.long},
+                        {key:"loss",     label:lang==="es"?"✗ Perdió":"✗ Loss",     color:C.short},
+                        {key:"cancelled",label:lang==="es"?"Cancelada":"Cancelled", color:C.wait},
+                      ].map(o=>(
+                        <button key={o.key} onClick={()=>updateOutcome(s.id,o.key,null)}
+                          style={{padding:"3px 10px",fontSize:10,fontWeight:600,borderRadius:6,cursor:"pointer",
+                            border:`1px solid ${(outcomeMap[s.id]||s.outcome)===o.key?o.color:C.border}`,
+                            background:(outcomeMap[s.id]||s.outcome)===o.key?`${o.color}18`:"transparent",
+                            color:(outcomeMap[s.id]||s.outcome)===o.key?o.color:C.subtle}}>
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {tab==="portfolio" && (
             <div className="fade">
               <h2 style={{fontFamily:"'Libre Baskerville'",fontSize:20,fontWeight:700,color:C.heading,marginBottom:6}}>
@@ -1110,6 +1382,57 @@ REACT_APP_FINNHUB_KEY=tu_key_de_finnhub`}
           )}
         </main>
       </div>
+
+      {/* ── Floating ARIA Chat ── */}
+      <button onClick={()=>setChatOpen(o=>!o)}
+        style={{position:"fixed",bottom:24,right:24,width:52,height:52,borderRadius:"50%",background:C.accent,border:"none",cursor:"pointer",boxShadow:`0 4px 20px ${C.accent}60`,display:"flex",alignItems:"center",justifyContent:"center",zIndex:300,fontSize:chatOpen?18:22,transition:"all 0.2s",color:"#fff"}}>
+        {chatOpen ? "✕" : "✦"}
+      </button>
+
+      {chatOpen && (
+        <div style={{position:"fixed",bottom:88,right:24,width:340,maxWidth:"calc(100vw - 32px)",height:460,background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,boxShadow:C.shadow,zIndex:299,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10,background:C.card}}>
+            <div style={{width:32,height:32,borderRadius:"50%",background:C.accent,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+              <span style={{color:"#fff",fontFamily:"'Libre Baskerville'",fontWeight:700,fontSize:13}}>A</span>
+            </div>
+            <div>
+              <div style={{fontFamily:"'Libre Baskerville'",fontWeight:700,fontSize:13,color:C.heading}}>ARIA</div>
+              <div style={{fontSize:9,color:C.long,letterSpacing:1}}>● {lang==="es"?"Agente activo":"Agent active"} · {asset.label}</div>
+            </div>
+            <button onClick={()=>setChatMsgs([{role:"aria",text:lang==="es"?"Chat reiniciado. ¿En qué puedo ayudarte?":"Chat reset. How can I help?"}])}
+              style={{marginLeft:"auto",fontSize:10,color:C.subtle,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"3px 8px",cursor:"pointer"}}>
+              {lang==="es"?"Limpiar":"Clear"}
+            </button>
+          </div>
+          <div style={{flex:1,overflowY:"auto",padding:"14px 16px",display:"flex",flexDirection:"column",gap:10}}>
+            {chatMsgs.map((m,i) => (
+              <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
+                <div style={{maxWidth:"82%",padding:"9px 13px",borderRadius:m.role==="user"?"14px 14px 4px 14px":"14px 14px 14px 4px",background:m.role==="user"?C.accent:C.card,border:m.role==="aria"?`1px solid ${C.border}`:"none",fontSize:12.5,color:m.role==="user"?"#fff":C.text,lineHeight:1.6}}>
+                  {m.text}
+                </div>
+              </div>
+            ))}
+            {chatLoading && (
+              <div style={{display:"flex",justifyContent:"flex-start"}}>
+                <div style={{padding:"9px 14px",borderRadius:"14px 14px 14px 4px",background:C.card,border:`1px solid ${C.border}`,fontSize:12,color:C.subtle}}>
+                  <span className="pulse" style={{display:"inline-block"}}>ARIA {lang==="es"?"está escribiendo":"is typing"}…</span>
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef}/>
+          </div>
+          <div style={{padding:"12px 14px",borderTop:`1px solid ${C.border}`,display:"flex",gap:8,background:C.card}}>
+            <input value={chatInput} onChange={e=>setChatInput(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&sendChat()}
+              placeholder={lang==="es"?"Pregúntale a ARIA…":"Ask ARIA…"}
+              style={{flex:1,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"8px 12px",fontSize:12.5,color:C.text,outline:"none"}}/>
+            <button onClick={sendChat} disabled={chatLoading||!chatInput.trim()}
+              style={{padding:"8px 14px",background:C.accent,border:"none",borderRadius:8,color:"#fff",fontSize:14,fontWeight:600,cursor:"pointer",opacity:chatLoading||!chatInput.trim()?0.5:1}}>
+              ➤
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
