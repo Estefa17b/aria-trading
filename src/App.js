@@ -16,27 +16,51 @@ const sbUpdate  = async (table, id, data) => { try { await fetch(`${SB_URL}/rest
 // ─── Assets ───────────────────────────────────────────────────────────────────
 const ASSET_GROUPS = {
   Crypto: [
-    { id:"BTCUSDT", label:"BTC/USDT", name:"Bitcoin",  icon:"₿", src:"binance" },
-    { id:"ETHUSDT", label:"ETH/USDT", name:"Ethereum", icon:"Ξ", src:"binance" },
-    { id:"SOLUSDT", label:"SOL/USDT", name:"Solana",   icon:"◎", src:"binance" },
+    { id:"BTCUSDT",  label:"BTC/USDT",  name:"Bitcoin",        icon:"₿",  src:"binance" },
+    { id:"ETHUSDT",  label:"ETH/USDT",  name:"Ethereum",       icon:"Ξ",  src:"binance" },
+    { id:"SOLUSDT",  label:"SOL/USDT",  name:"Solana",         icon:"◎",  src:"binance" },
+    { id:"BNBUSDT",  label:"BNB/USDT",  name:"BNB",            icon:"⬡",  src:"binance" },
+    { id:"XRPUSDT",  label:"XRP/USDT",  name:"Ripple",         icon:"✕",  src:"binance" },
+    { id:"ADAUSDT",  label:"ADA/USDT",  name:"Cardano",        icon:"₳",  src:"binance" },
+    { id:"DOGEUSDT", label:"DOGE/USDT", name:"Dogecoin",       icon:"Ð",  src:"binance" },
+    { id:"AVAXUSDT", label:"AVAX/USDT", name:"Avalanche",      icon:"🔺", src:"binance" },
+    { id:"DOTUSDT",  label:"DOT/USDT",  name:"Polkadot",       icon:"●",  src:"binance" },
+    { id:"LINKUSDT", label:"LINK/USDT", name:"Chainlink",      icon:"⬡",  src:"binance" },
+    { id:"MATICUSDT",label:"MATIC/USDT",name:"Polygon",        icon:"⬟",  src:"binance" },
+    { id:"UNIUSDT",  label:"UNI/USDT",  name:"Uniswap",        icon:"🦄",  src:"binance" },
   ],
   Forex: [
-    { id:"EURUSD=X", label:"EUR/USD", name:"Euro/Dollar",   icon:"€", src:"yahoo" },
-    { id:"GBPUSD=X", label:"GBP/USD", name:"Pound/Dollar",  icon:"£", src:"yahoo" },
-    { id:"JPY=X",    label:"USD/JPY", name:"Dollar/Yen",    icon:"¥", src:"yahoo" },
+    { id:"EURUSD=X", label:"EUR/USD", name:"Euro/Dollar",      icon:"€",  src:"yahoo" },
+    { id:"GBPUSD=X", label:"GBP/USD", name:"Pound/Dollar",     icon:"£",  src:"yahoo" },
+    { id:"JPY=X",    label:"USD/JPY", name:"Dollar/Yen",       icon:"¥",  src:"yahoo" },
+    { id:"USDMXN=X", label:"USD/MXN", name:"Dollar/Peso MX",  icon:"$",  src:"yahoo" },
+    { id:"USDCAD=X", label:"USD/CAD", name:"Dollar/Cad",       icon:"CA", src:"yahoo" },
   ],
   Equities: [
-    { id:"SPY", label:"S&P 500", name:"S&P 500 ETF",    icon:"📈", src:"yahoo" },
-    { id:"QQQ", label:"NASDAQ",  name:"Nasdaq 100 ETF", icon:"⬡",  src:"yahoo" },
+    { id:"SPY",  label:"S&P 500",  name:"S&P 500 ETF",     icon:"📈", src:"yahoo" },
+    { id:"QQQ",  label:"NASDAQ",   name:"Nasdaq 100 ETF",  icon:"📊", src:"yahoo" },
+    { id:"DIA",  label:"DOW JONES",name:"Dow Jones ETF",   icon:"🏛",  src:"yahoo" },
+    { id:"NVDA", label:"NVIDIA",   name:"NVIDIA Corp.",    icon:"🟢", src:"yahoo" },
+    { id:"AAPL", label:"APPLE",    name:"Apple Inc.",      icon:"🍎", src:"yahoo" },
   ],
   Commodities: [
-    { id:"GC=F", label:"XAU/USD", name:"Gold Futures",     icon:"Au", src:"yahoo" },
-    { id:"CL=F", label:"WTI Oil", name:"Crude Oil Futures", icon:"🛢", src:"yahoo" },
+    { id:"GC=F",  label:"ORO",       name:"Gold Futures",      icon:"Au", src:"yahoo" },
+    { id:"CL=F",  label:"WTI Oil",   name:"Crude Oil WTI",     icon:"🛢", src:"yahoo" },
+    { id:"BZ=F",  label:"Brent Oil", name:"Crude Oil Brent",   icon:"🛢", src:"yahoo" },
+    { id:"SI=F",  label:"PLATA",     name:"Silver Futures",    icon:"Ag", src:"yahoo" },
+    { id:"NG=F",  label:"GAS NAT.",  name:"Natural Gas",       icon:"🔥", src:"yahoo" },
+    { id:"HG=F",  label:"COBRE",     name:"Copper Futures",    icon:"🟠", src:"yahoo" },
+    { id:"ZW=F",  label:"TRIGO",     name:"Wheat Futures",     icon:"🌾", src:"yahoo" },
+    { id:"ZC=F",  label:"MAÍZ",      name:"Corn Futures",      icon:"🌽", src:"yahoo" },
   ],
 };
 const ALL_ASSETS   = Object.values(ASSET_GROUPS).flat();
 const LEVERAGE_OPS = [1,2,3,5,10,20,50];
-const SIM_BASES    = { "EURUSD=X":1.085, "GBPUSD=X":1.265, "JPY=X":149.5, SPY:527, QQQ:448, "GC=F":2320, "CL=F":78.4 };
+const SIM_BASES    = {
+  "EURUSD=X":1.085, "GBPUSD=X":1.265, "JPY=X":149.5, "USDMXN=X":17.2, "USDCAD=X":1.36,
+  SPY:527, QQQ:448, DIA:395, NVDA:950, AAPL:220,
+  "GC=F":2320, "CL=F":78.4, "BZ=F":82.1, "SI=F":27.5, "NG=F":2.8, "HG=F":4.2, "ZW=F":580, "ZC=F":440,
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt   = (n,d=2) => Number(n).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
